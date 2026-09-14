@@ -78,17 +78,23 @@ def repair_and_load_done(out: Path) -> set[str]:
 
 
 async def sample_raw(teacher: ModelPool, sticky_key: str, prompt: str,
-                     temperature: float, max_tokens: int) -> dict:
+                     temperature: float, max_tokens: int, n: int = 1) -> dict:
     """VllmModel.sample's request, but returning the whole response so the
     raw text survives. Same replica pick, semaphore and retries as the duel
-    (ModelPool._pick / VllmModel._post)."""
-    return await teacher._pick(sticky_key)._post({
+    (ModelPool._pick / VllmModel._post). n > 1 asks for n independent
+    samples in one request: the prompt is prefilled once and the n decodes
+    share its KV (return_token_ids keeps per-choice completion lengths)."""
+    payload = {
         "model": teacher.cfg.request_model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "add_special_tokens": False,
-    })
+    }
+    if n > 1:
+        payload["n"] = n
+        payload["return_token_ids"] = True
+    return await teacher._pick(sticky_key)._post(payload)
 
 
 def rollout_record(choice: dict, usage: dict, action_kind: str) -> dict:
@@ -106,7 +112,9 @@ def rollout_record(choice: dict, usage: dict, action_kind: str) -> dict:
         "raw": raw,
         "finish_reason": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
+        "completion_tokens": (len(choice["token_ids"])
+                              if choice.get("token_ids") is not None
+                              else usage.get("completion_tokens")),
         "think_closed": closed,
         "reasoning": reasoning,
         "content": content,
@@ -137,6 +145,11 @@ async def run(args: argparse.Namespace) -> None:
     by_tid = {r["turn_id"]: r for r in corpus.load_index_rows()}
 
     wanted = read_turn_ids(args.turn_ids)
+    if args.limit:
+        wanted = wanted[:args.limit]
+    if args.num_shards > 1:
+        # Round-robin keeps each shard's length / dialect mix like the whole.
+        wanted = wanted[args.shard::args.num_shards]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     err_path = args.out.with_suffix(".errors.jsonl")
     meta_path = args.out.with_suffix(".meta.json")
@@ -149,6 +162,7 @@ async def run(args: argparse.Namespace) -> None:
             "max_tokens_by_kind": {kind: list(caps(kind))
                                    for kind in dialects.DIALECTS},
             "add_special_tokens": False,
+            "requests_per_turn": 1 if args.batch_n else k,
             "prompt": "evalsrv.chat.gen_prompt",
             "split": "evalsrv.chat.split_rollout(require_think_close=False)",
         },
@@ -157,6 +171,11 @@ async def run(args: argparse.Namespace) -> None:
             "thought_echo": thought_echo,
             "fields": "lp_own=lpC(y|z_C) lp_empty=lpC(y|empty) "
                       "lp_thought=lpC(z_C|x), mean logprob per byte",
+        } if args.echo == "all" else {
+            "fn": "evalsrv.vllm_client.VllmModel.score_thought",
+            "thought_echo": True,
+            "fields": "lp_thought=lpC(z_C|x), mean logprob per byte; "
+                      "lp_own / lp_empty not computed (null)",
         },
         "corpus": {key: cinfo[key] for key in (
             "corpus_epoch", "manifest_sha256", "schema_version", "view_spec",
@@ -218,20 +237,39 @@ async def run(args: argparse.Namespace) -> None:
             max_thought, max_action = caps(kind)
             prompt = await asyncio.to_thread(
                 gen_prompt, repo, revision, rec["prefix"])
-            ds = await asyncio.gather(*[
-                sample_raw(teacher, tid, prompt, temperature,
-                           max_thought + max_action)
-                for _ in range(k)])
-            rollouts = [rollout_record(d["choices"][0], d.get("usage") or {},
-                                       kind) for d in ds]
+            if args.batch_n:
+                d = await sample_raw(teacher, tid, prompt, temperature,
+                                     max_thought + max_action, n=k)
+                choices = sorted(d["choices"], key=lambda c: c.get("index", 0))
+                if len(choices) != k:
+                    raise RuntimeError(f"asked n={k}, got {len(choices)} choices")
+                rollouts = [rollout_record(c, d.get("usage") or {}, kind)
+                            for c in choices]
+            else:
+                ds = await asyncio.gather(*[
+                    sample_raw(teacher, tid, prompt, temperature,
+                               max_thought + max_action)
+                    for _ in range(k)])
+                rollouts = [rollout_record(d["choices"][0],
+                                           d.get("usage") or {}, kind)
+                            for d in ds]
             parsed = [r for r in rollouts if r["parsed"]]
-            scored = await score_teacher_rollouts(
-                teacher, rec["prefix"], [(r["z"], r["y"]) for r in parsed],
-                thought_echo=thought_echo, sticky_key=tid)
-            for r, s in zip(parsed, scored):
-                r["lp_own"] = s["lp_own"]
-                r["lp_empty"] = s["lp_empty"]
-                r["lp_thought"] = s.get("lp_thought")
+            if args.echo == "thought":
+                # Grounding echo only: lp_thought = lpC(z_C|x), the same
+                # score_thought call score_teacher_rollouts makes.
+                scored = await asyncio.gather(*[
+                    teacher.score_thought(rec["prefix"], r["z"], sticky_key=tid)
+                    for r in parsed])
+                for r, s in zip(parsed, scored):
+                    r["lp_thought"] = s["lp_per_byte"]
+            else:
+                scored = await score_teacher_rollouts(
+                    teacher, rec["prefix"], [(r["z"], r["y"]) for r in parsed],
+                    thought_echo=thought_echo, sticky_key=tid)
+                for r, s in zip(parsed, scored):
+                    r["lp_own"] = s["lp_own"]
+                    r["lp_empty"] = s["lp_empty"]
+                    r["lp_thought"] = s.get("lp_thought")
             out_f.write(orjson.dumps({
                 "turn_id": tid,
                 "action_kind": kind,
@@ -263,8 +301,10 @@ async def run(args: argparse.Namespace) -> None:
                 if (stats["turns"] % args.log_every == 0
                         or stats["turns"] == len(todo)):
                     el = time.monotonic() - started
-                    log.info("%d/%d turns (%.2f turns/s) errors=%d parse=%.3f",
-                             stats["turns"], len(todo), stats["turns"] / el,
+                    rate = stats["turns"] / el
+                    log.info("%d/%d turns (%.2f turns/s, eta %.2fh) errors=%d "
+                             "parse=%.3f", stats["turns"], len(todo), rate,
+                             (len(todo) - stats["turns"]) / rate / 3600,
                              stats["errors"],
                              stats["parsed"] / max(stats["rollouts"], 1))
 
@@ -293,6 +333,17 @@ def main() -> None:
                     help="turns in flight (duel default [duel].concurrency)")
     ap.add_argument("--per-replica", type=int, default=128,
                     help="max in-flight requests per replica")
+    ap.add_argument("--batch-n", action="store_true",
+                    help="sample the k rollouts as one n=k request (one "
+                         "prefill, shared prefix KV) instead of k requests")
+    ap.add_argument("--echo", choices=("all", "thought"), default="all",
+                    help="all: lp_own + lp_empty + lp_thought (duel refs); "
+                         "thought: lp_thought only")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="keep only the first N turn_ids of the list")
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="process turn_ids[shard::num_shards] (after --limit)")
     ap.add_argument("--data-dir", type=Path, default=TG_ROOT / "corpus")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--force", action="store_true",
