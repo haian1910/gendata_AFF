@@ -1,0 +1,750 @@
+# Affine chain contract. Single source of truth for the live game.
+# Everything the validator, eval server, and miners need to agree on lives
+# here; secrets come from the environment (doppler), never from this file.
+
+[subnet]
+name = "Affine"
+netuid = 120
+network = "finney"
+# Emission fallback when no king in the chain is registered.
+burn_uid = 0
+# Rolling last-N kings payout (Albedo / Teutonic design): current king + up
+# to N-1 prior distinct kings share emissions equally (1/N each). Unregistered
+# members of the chain are skipped at weight-set time; empty chain → burn_uid.
+king_chain_size = 5
+# Reveals at or below this block are ignored. MUST be set to a recent block
+# at go-live so pre-launch test reveals are not eligible (-1 = unset guard:
+# the validator refuses to start until an operator sets a real value).
+# 2026-08-27 (wvk-10 fork + genesis reset): bumped to the finney tip at
+# reset time so every wvk-9-era reveal is invalidated — miners must submit
+# fresh under min(R,G) + the Qwen3.8-27B teacher.
+min_submission_block = 8938619
+# Bittensor weight-version gate for contract upgrades (bump on breaking
+# scoring/contract changes so stale validators are ignored by consensus).
+# Current: 12 (forfeit floor, 2026-09-05; 11 = dialects + schema-3 D,
+# 2026-09-05). 10 was min(R,G) v5 scoring fork + genesis reset, 2026-08-27,
+# explicit dated operator directive via the approved release plan — the
+# wvk-9 king crowned on a constant filler suffix and benched 0/50; the new
+# rule scores each turn min(centered Reason, banded Grounding); see [duel]
+# comment + research/docs/MIN_RG_PROPOSAL.md). History: 1→2 teacher swap
+# (2026-08-10, later reverted to GLM-Air); 2→3 Reason v3 scoring fork;
+# 3→4 min_margin=0.002 (2026-08-12); 4→5 min_thought_chars=80 (2026-08-13,
+# empty/cue-thought kings); 5→6 causality_gate=true (2026-08-13,
+# teacher-side B license); 6→7 Reason v4 (2026-08-17, tempered
+# log-mean-exp over k=3 teacher refs); 7→8 min_margin 0.002→0.001
+# (2026-08-21, δ recalibrated to the v4 margin scale); 8→9 min_margin
+# 0.001→0.002 revert (2026-08-22); 9→10 min(R,G) v5 (2026-08-27); 10→11
+# action dialects + trace-first corpus (2026-09-05, notice 2026-09-02): D admits
+# boxed + tool_call turns next to bash and is served as a schema_version 3
+# view over rollout traces (corpus/manifest.json on data.affine.io); score
+# unchanged; forward-only, reign stands.
+# 11→12 forfeit floor (2026-09-05): a turn with no parseable action scores
+# forfeit_turn_score (−0.1) instead of leaving the pairing; one-sided =
+# loss, two-sided = tie. min(R,G) unchanged. Forward-only; reign stands.
+# 12→13 think-close forfeit + text dialect (2026-09-09): a rollout without
+# </think> forfeits (require_think_close), and the visible final reply of
+# a self-ended rollout is a scored action (allowed_action_kinds += text).
+# min(R,G) math unchanged. Forward-only; reign stands.
+# 13→14 terminus_json dialect (2026-09-10): the Terminus 2 (terminal-bench
+# agent) JSON command batch is a scored action (allowed_action_kinds +=
+# terminus_json). min(R,G) math unchanged. Forward-only; reign stands.
+#
+# ############################################################################
+# #  NEVER CHANGE THIS NUMBER. (operator directive, 2026-08-10)              #
+# #  Not for teacher moves, serving knobs, corpus refreshes, doc passes,     #
+# #  or any "cleanup". Only a NEW, EXPLICIT, DATED operator directive that   #
+# #  names this key may change it. If you think it needs a bump: STOP ASK.   #
+# ############################################################################
+weight_version_key = 14
+
+[wallet]
+name = "default"
+hotkey = "default"
+
+[submission]
+# Reveal payload, timelock-encrypted via Commitments.set_commitment:
+#   affine1|<hf_repo>|<hf_revision_40hex>|<author_hotkey_ss58>
+reveal_prefix = "affine1"
+repo_pattern = '^[^/]+/[Aa]ffine-.+$'
+# Anti-impersonation: repo id must contain the first N AND last M chars of
+# the submitter's coldkey OR hotkey ss58 (case-insensitive; both halves
+# matched independently so a full embedded ss58 also passes; tail carries
+# checksum).
+coldkey_prefix_len = 5
+coldkey_suffix_len = 5
+# Repo hygiene caps enforced before any download of weights.
+#   max_model_size_gb  — cap on .safetensors bytes (the servable weights).
+#   max_total_repo_gb  — cap on TOTAL repo bytes (blocks oversized junk files
+#                        that bypass the safetensors cap and disk-DoS the pod).
+max_model_size_gb = 90.0
+max_total_repo_gb = 100.0
+allow_python_files = false
+allow_auto_map = false
+# Metadata-intake guards on attacker-controlled repos.
+max_repo_files = 5000
+max_config_bytes = 1048576   # 1 MiB; config.json larger than this is rejected
+
+# Private submissions over Cloudflare R2 (affine2 reveals; affine/r2protocol.py
+# is the byte-level contract, scripts/submit.py the miner client). Miners
+# never publish weights: they commit `affine2|activate|<hotkey>|<ed25519 sig>`,
+# the validator seals prefix-scoped temporary R2 credentials to the hotkey
+# in a public mailbox blob, the miner uploads + commits
+# `affine2|ready|<registration_id>|<manifest_sha256>`, the validator revokes
+# the credential, verifies the signed manifest and duels the private prefix.
+# Only a crowned model is copied to the public bucket
+# (models/sha256/<model_digest>/). Hotkeys MUST be Ed25519 (the mailbox is a
+# NaCl sealed box to the hotkey; sr25519 keys cannot open it).
+#   enabled          — false: affine2 payloads are ignored, HF path unchanged.
+#   hf_cutover_block — affine1 (HF) reveals above this block are rejected
+#                      (-1 = never). Set to the finney tip at go-live.
+#   private_retention_days — R2 lifecycle age on models/registrations/**.
+#                      Must exceed the longest a queued or crowned-but-
+#                      unpromoted prefix can sit (the validator re-promotes a
+#                      private-ref king on every weight sweep); losers stay
+#                      readable for post-crown audit / re-eval this long.
+# Admission mechanics only — no scoring change, no weight_version_key bump.
+[submission.r2]
+# 2026-09-03: LIVE (explicit dated operator directive). affine1 (HF) reveals
+# above hf_cutover_block are dropped at intake; queued HF entries below it
+# still duel.
+enabled = true
+reveal_prefix = "affine2"
+private_bucket = "affine-private-models"
+public_bucket = "affine-models"
+dash_bucket = "affine-dash"
+public_models_base_url = "https://models.affine.io"
+mailbox_base_url = "https://dash.affine.io"
+credential_ttl_s = 604800
+hf_cutover_block = 8987674
+private_retention_days = 60
+
+# Architecture pin (2026-08-28, explicit operator directive): every submission's
+# config.json must match this nested subset exactly — i.e. be a fine-tune of the
+# genesis family (Qwen3.6-35B-A3B @ 995ad96e). Keys absent here (dtype,
+# rope_parameters, eos ids, ...) stay free. Closes the teacher-upload play:
+# the frozen teacher's own thoughts land in-band on G and top R by construction,
+# so an unrestricted board converges to "whoever uploads the teacher first
+# holds the throne forever". Enforced pre-download at dispatch AND prefetch
+# (validator._hygiene_reason -> model_store.validate_repo_arch); an admission
+# rule, not a scoring change — verdicts and replays are untouched.
+[submission.pinned_arch]
+architectures = ["Qwen3_5MoeForConditionalGeneration"]
+model_type = "qwen3_5_moe"
+tie_word_embeddings = false
+
+[submission.pinned_arch.text_config]
+model_type = "qwen3_5_moe_text"
+hidden_size = 2048
+num_hidden_layers = 40
+num_attention_heads = 16
+num_key_value_heads = 2
+head_dim = 256
+num_experts = 256
+num_experts_per_tok = 8
+moe_intermediate_size = 512
+shared_expert_intermediate_size = 512
+vocab_size = 248320
+full_attention_interval = 4
+linear_num_key_heads = 16
+linear_num_value_heads = 32
+linear_key_head_dim = 128
+linear_value_head_dim = 128
+
+# 2026-09-04 (explicit operator directive, "allow it"): a text-only extraction
+# of the genesis family is a valid fine-tune too. transformers' text-only class
+# drops the vision tower and flattens text_config to the root of config.json
+# (model_type qwen3_5_moe_text); vLLM 0.28 serves it (Qwen3_5MoeForCausalLM is
+# in its registry). A submission passes the pin if it matches [pinned_arch] OR
+# any [[pinned_arch_alt]] profile. Same compute-graph shape either way — the
+# teacher (Qwen3_5 dense, 27B) still matches neither. Admission rule only.
+[[submission.pinned_arch_alt]]
+architectures = ["Qwen3_5MoeForCausalLM"]
+model_type = "qwen3_5_moe_text"
+tie_word_embeddings = false
+hidden_size = 2048
+num_hidden_layers = 40
+num_attention_heads = 16
+num_key_value_heads = 2
+head_dim = 256
+num_experts = 256
+num_experts_per_tok = 8
+moe_intermediate_size = 512
+shared_expert_intermediate_size = 512
+vocab_size = 248320
+full_attention_interval = 4
+linear_num_key_heads = 16
+linear_num_value_heads = 32
+linear_key_head_dim = 128
+linear_value_head_dim = 128
+
+[teacher]
+# Frozen frontier reference C.
+# Qwen/Qwen3.8-27B since 2026-08-27 (explicit dated operator directive,
+# bundled into the wvk-10 min(R,G) fork + genesis reset; GLM-4.5-Air-FP8
+# served eras wvk <= 9). 27B dense GDN+vision hybrid, thinking-on template
+# that already ends inside <think> — the duel rendering is unchanged.
+# Serving floor: vLLM >= 0.28 (GDN kernels ICE cutlass JIT on 0.22.x).
+# Echo spike scales with vocab (248,320 vs GLM's ~151k): fp32 log_softmax
+# needs chunk x vocab x 4B outside the budgeted pool — teacher chunk/util
+# below are sized for that (8192 -> 7.6 GiB spike, probed clean on B200
+# 2026-08-27 under 12 concurrent 64k echoes).
+#
+# 2026-08-28 (explicit operator directive): full remote-teacher cutover.
+# The eval box no longer serves a local teacher. All teacher sample/echo
+# traffic goes through the swarm router (ops/teacher-swarm/) at
+# 127.0.0.1:9100 — dedicated 8x B200 boxes, TP1 replicas. The 2026-08-10
+# GLM-5.2 remote push was torn down and never cut over; this is the dated
+# directive that [teacher].base_url required. Fail-closed: a dark router
+# fails ensure_teacher and the validator requeues (Fault.TEACHER, no miner
+# burn). Router already 503s on an empty pool. Ops knob only — no
+# weight_version_key event. teacher_serveds returns only this remote slot
+# (extra_urls unused). Rollback: unset base_url, restore local GPU map,
+# restart evalsrv.
+repo = "Qwen/Qwen3.8-27B"
+base_url = "http://127.0.0.1:9100/v1"
+port = 8000
+tp = 2
+gpus = "0,1"
+# Unused while base_url is set (2026-08-28 remote cutover). Kept commented
+# so rollback can re-enable the local pair without hunting ports.
+# replica_port = 8003
+# replica_gpus = "6,7"
+# extra_urls listed the router 8x to weight swarm vs local; locals are gone.
+
+[miner_serving]
+# King stays warm; challenger is loaded per duel.
+# 2026-08-28: eval box is miner-only. Two TP2 copies of each miner occupy
+# the 8 GPUs that used to split teacher + king + challenger. Replicas are
+# best-effort (same as the old teacher2): primary required, copy optional.
+# Score-invariant — miners sample; the ranked quantity is teacher-side.
+king_port = 8001
+king_gpus = "0,1"
+king_replica_port = 8003
+king_replica_gpus = "2,3"
+challenger_port = 8002
+challenger_gpus = "4,5"
+challenger_replica_port = 8004
+challenger_replica_gpus = "6,7"
+tp = 2
+# Was 32768; corpus prefixes routinely hit ~31k tokens, and sample() asks for
+# max_thought+max_action=1792 more → vLLM 400 "maximum context length" mid-duel
+# (observed 2026-08-09/10, burned as eval_infra_exhausted). 65536 clears the
+# knife-edge; both GLM-Air and Qwen3.6-35B support ≥128k. Ops knob only.
+# 65536 -> 131072 (2026-09-07): the corpus caps prefixes at 120k CHARS, not
+# tokens; a schema-3 turn tokenized to 63,745 and +1792 gen = 65,537 blew
+# the limit by one token on king2. Fault.CONTEXT_LIMIT requeues the same
+# entry (pod-wide infra, no penalty), so chal-00290 looped 25x at ~26 min
+# each — 14.5 h with zero verdicts. Teacher swarm raised in lockstep
+# (ops/teacher-swarm/swarm.toml). 2xH200 TP2 has ample KV for 128k.
+max_model_len = 131072
+# 0.80 (not the usual 0.85–0.90): teacher-forcing echo+logprobs materializes
+# an fp32 log_softmax over (step_tokens x vocab) OUTSIDE vLLM's budgeted pool
+# — ~5 GB transient at 8192x151k — so the duel pod needs real headroom.
+# 0.85 + 16384 OOM'd the king mid-duel on 268 GiB B300s (2026-08-04).
+gpu_memory_utilization = 0.80
+# Scheduler token budget per engine step for MINER slots (king/challenger).
+# Under reason_only miners only sample — the sole echo they serve is the
+# injectability probe. 4096 (2026-08-15) was for a tight 6.3 GiB-free
+# checkpoint where an 8192-chunk probe spike OOM'd. The live eval box is
+# 8x B300 (~50 GiB free at 0.80 util after load, before scoring fills KV);
+# corpus prefixes are ~31k tokens. 4096 → ~8 prefill steps; 8192 (2026-08-29)
+# halved that. 8192 → 16384 (2026-08-30) halves it again (4 steps → 2).
+# Probe spike scales with the chunk (~16 GiB at 16384) and runs on empty KV
+# (~50 GiB free). Mid-scoring the tightest pair has shown ~25 GiB free —
+# miners do not echo then. Roll back to 8192 if a probe OOM's. Ops knob
+# only — no scoring effect.
+# 16384 → 8192 rollback (2026-09-02): the live box is 8x 183 GB (178.35 GiB
+# usable), not B300s — a loaded miner slot at 0.80 util sits at ~146 GiB, so
+# headroom is ~32 GiB, and the probe echo materializes TWO ~15 GiB fp32
+# tensors (logits + log_softmax) at 16384 x 248,320. 70 identical probe
+# OOMs ("14.65 GiB wanted, 14.37 free") from 2026-09-01 19:10 on; every
+# affected challenger (chal-00179/182/183) bounced through 6 infra retries.
+max_num_batched_tokens = 8192
+# Teacher slots only: bigger chunks cut the echo queue wait that dominates
+# duel wall time. At 0.80 util the 12288 spike OOM'd teacher2 mid-duel
+# (2026-08-14, 6.93 GiB wanted vs 6.66 free), so teachers also run a lower
+# gpu_memory_utilization — their KV cache sits at ~2-5% full, so trading
+# ~14 GB of unused KV pool for spike headroom costs nothing.
+# 12288 -> 8192 with the Qwen3.8-27B teacher (2026-08-27): its 248,320-token
+# vocab makes the fp32 echo spike ~65% larger per chunk token (12288 would
+# want ~11.4 GiB and killed the engine on the probe box; 8192 -> 7.6 GiB,
+# stress-probed clean under concurrent 64k echoes).
+teacher_max_num_batched_tokens = 8192
+teacher_gpu_memory_utilization = 0.70
+
+[dataset]
+# Unlabeled turn corpus D: append-only shards + an immutable-manifest pointer
+# on the public Hippius bucket. Push data = new shard + new manifest revision;
+# remove data = flip a shard inactive in a new revision (objects are never
+# deleted — old verdicts stay replayable). The eval machine syncs anonymously,
+# verifies the manifest hash resolves at turns/manifests/{hash}.json and every
+# shard sha256, and refuses to duel without a verified corpus (fail-closed).
+# Duel slices are seeded from the reveal-block hash so miners cannot
+# precompute them (private pool: rejected, see RESEARCH_LOG 2026-08-03), and
+# every verdict stamps the manifest sha256 it was scored against.
+# Corpus refresh no longer bumps weight_version_key — that stays reserved for
+# scoring-rule forks. RT-6 mitigations: fresh teacher y_C at duel time,
+# reveal-block slice seeding, and periodic shard refresh/retirement via
+# scripts/corpus_push.py (ρ_late=+0.845 stability: results/rt6_temporal_holdout.json).
+# 2026-09-03: data LOCATION only (explicit dated operator directive). Same
+# schema-2 manifest, same sha, turns/** a byte-identical copy of the
+# Hippius history; Hippius affine-sn120/turns/** is read-only from this
+# date. Not a scoring change -- no weight_version_key event. The
+# schema-3 manifest_key (corpus/manifest.json) lands at the wvk 11 T0.
+corpus_base_url = "https://data.affine.io"
+# 2026-09-05 (weight_version_key 10→11): the schema-3 view duel_turns@v4. Every
+# pre-T0 verdict's slice.manifest_sha256 still resolves at
+# data.affine.io/turns/manifests/{sha} (schema-2 history, immutable).
+manifest_key = "corpus/manifest.json"
+# Trace-first corpus (2026-09-02, cuts over at the wvk 11 T0 on an explicit
+# dated operator directive): the canonical object becomes the full rollout
+# trace (verifiers message graph incl. reasoning_content and tool schemas)
+# under `traces/` on the [data_r2] bucket, and D is a versioned VIEW derived
+# from it (affine/corpus/view.py) — a turn's prefix is the root->reply path
+# of the graph, i.e. exactly the prompt the model was sent, for any harness.
+# `view_spec` names the derivation; a new view (e.g. prior reasoning kept in
+# tool-loop prefixes) is a new spec built from the same traces, never new
+# rollouts. `traces_manifest_key` is the pointer the view builder follows.
+# Rollback (data only): manifest_key back to turns/manifest.json restores
+# the schema-2 slice population; weight_version_key does not roll back.
+traces_manifest_key = "traces/manifest.json"
+view_spec = "duel_turns@v4"
+# Pod re-checks the manifest pointer this often (between duels, never mid-duel).
+refresh_interval_s = 3600
+# Action dialects admitted into live D (2026-09-01). A dialect says where a
+# turn's action span starts and ends (affine/dialects.py: bash = one closed
+# ```bash block; tool_call = <tool_call>…</tool_call>; boxed = \boxed{…}).
+# The min(R,G) math never looks inside the action, so parsing support for a
+# new dialect is a code change, not a scoring change; ADMITTING one here is a
+# contract event — every miner must then emit that dialect on those turns or
+# forfeit them — and belongs with an explicit dated operator directive (and
+# a weight_version_key decision), not an agent edit. The fold refuses turns
+# outside this list; the duel refuses a slice that contains one (tripwire).
+# 2026-09-05 (weight_version_key 10→11, explicit dated operator directive):
+# boxed (math, affine-math-v1) and tool_call (wiki search, affine-wiki-v1)
+# admitted; target slice shares math 0.10 / tool_use 0.10 via strata count.
+# Notice posted 2026-09-02 (llms.txt "Upcoming fork", Discord, dashboard).
+# 2026-09-09 (weight_version_key 12→13, explicit dated operator directive):
+# text admitted — the visible final reply of a rollout that stopped by
+# itself (agent_completed, untruncated) is an action; the reply the
+# model chose to end on. Fed by the traces already published (bash /
+# pi / claude_code harness reports, wiki answers): no new rollouts, the
+# next fold picks them up. Why: min(R,G) never scored the visible
+# message, so kings learned to say nothing outside <think>
+# (SWE-bench Pro / Claude Code post-mortem 2026-09-08).
+# 2026-09-10 (weight_version_key 13→14, explicit dated operator directive
+# "do it now yes"): terminus_json admitted — the reply of harbor's Terminus 2
+# agent (the terminal-bench reference harness) is one JSON object
+# {"analysis", "plan", "commands": [...]}; the whole object is the action.
+# Its format mandate sits in the first USER message, so the marker check
+# reads that role too (Dialect.marker_roles). Fed by the teacher_terminus /
+# king_terminus rollouts policies (live on the datagen pods since 2026-09-10
+# ~19:00 UTC); the next fold admits them. Why: kings must work under the
+# agent harnesses people actually run (Claude Code, Hermes, terminal-bench);
+# a dialect the fold refuses never reaches D.
+allowed_action_kinds = ["bash", "tool_call", "boxed", "text", "terminus_json"]
+
+[duel]
+# min(R,G) v5 — centered Reason + banded Grounding (2026-08-27,
+# weight_version_key=10) — + δ crown floor + median thought-length floor +
+# B gate. The contract:
+#   a_i  = lpC(y_i|z_A) − lpC(y_i|∅)            (per teacher ref, k per turn)
+#   R    = tau·log((1/k)·Σ_i exp(a_i/tau)) − mean_i a_i   (centered Reason)
+#   m    = lpC(z_A|x); t_i = lpC(z_C^i|x)       (thought echoes, same prefix)
+#   G    = min(m − (mu − w), (mu + w) − m)      (banded Grounding)
+#          mu = mean(t_i), w = max(band_c·stdev(t_i), band_floor)
+#   turn = min(R, G)                            (score = mean over turns)
+#   crown = paired mean(turn_c − turn_k) > max(k_sigma · SE, min_margin)
+#           AND median(len(z.strip())) ≥ min_thought_chars
+#           AND B pass rate ≥ causality_gamma
+# No mix, no clip, no SE floor. The length floor evicts empty / cue kings.
+# B = lpC(y_A|z_A) − lpC(y_A|∅) is the license to play (not the score).
+#
+# Why min(R,G) (v5, 2026-08-27): the wvk-9 king crowned on a CONSTANT filler
+# suffix — a flat, task-independent lift that raises every a_i equally and
+# benches 0/50 on coding. Centering the tempered Reason cancels any
+# reference-independent shift by construction, so only committing to a
+# specific teacher mode pays. The grounding band requires the miner's
+# thought to be the kind of text the task actually induces: filler falls
+# BELOW the band (task doesn't make it likely), parroting/copying rises
+# ABOVE it (too predictable given the task). The min forces both legs at
+# once. Adversarially validated (suffix / parrot / boilerplate attacks,
+# direct GRPO optimization: all fail; held-out teacher thoughts win at
+# z=+2.56 where v4 was blind at z=+0.11); evidence in
+# research/results/minrg_round2/FINDINGS.txt + docs/MIN_RG_PROPOSAL.md.
+#
+# Why tempered (v4, kept as the R aggregation): the teacher's action
+# distribution is multi-modal; the log-mean-exp is dominated by the
+# best-matched ref, so committing beats hedging. k=1 reduces exactly to v3;
+# tau→∞ recovers the mean. Pre-fork verdicts replay via score_mode="reason".
+#
+# Sample budget: k=3 refs per turn; v5 adds k ref-thought echoes (shared by
+# both sides via the per-duel ref cache) + 1 miner-thought echo per side —
+# ~+40% teacher echo work, all sharing the turn-prefix KV via sticky routing.
+n_turns = 1300
+# Crown bar: k=2 (2026-08-11). False-crown under Gaussian null ≈ 2.28%/duel
+# (~1 in 44). Was 3.0 (~0.13%/duel) under the Reason v3 launch default.
+k_sigma = 2.0
+# Absolute crown-margin floor δ (2026-08-12, weight_version_key=4). Calibrated
+# from 148 archived duels (research/results/delta_calibration.{json,txt}):
+# live null SE ≈ 0.0015–0.0029/duel, so the honest crown bar 2·SE ≈ 0.0035
+# sits above δ and real duels never touch it. What it kills is low-variance
+# attackers the z-test cannot see: an ε-copy of the king has SE ≈ 0.0003 and
+# would crown on ±0.0006 noise margins at the same 1-in-44 as anyone else —
+# under the floor that is ~z=6.7 (≈1-in-7.6e10). Also caps SE-compression
+# (A11 family): the crown bar never drops below δ. Merges / freshly trained
+# parity models are policy-accepted (king-equivalent crowns don't regress
+# the ratchet), hence the floor sits at the lowest calibrated point rather
+# than higher.
+# 0.002→0.001 (2026-08-21, wvk 7→8, explicit dated operator directive): the
+# v4 tempered turn score compressed margins and noise ~2x (82 live v4 duels:
+# median 2·SE ≈ 0.0013 vs ≈ 0.0024 at v3 scale), leaving the old absolute δ
+# ~1.5x ABOVE the statistical bar — two challengers passed the 2σ test and
+# were blocked by δ alone (chal-00967 z=2.77, chal-00883 z=2.13). 0.001
+# restored the v3-era design ratio (δ ≈ 0.8x the typical 2·SE bar).
+# 0.001→0.002 REVERT (2026-08-22, wvk 8→9, explicit dated operator
+# directive): 18 hours at δ=0.001 produced 4 crowns (chal-00993/01008/
+# 01011/01013) with margins 0.00116-0.00153 — all in the band the old floor
+# blocked — while the winners' duel-measured Reason DRIFTED DOWN across the
+# chain (0.01954 → 0.01898 → 0.01847 → 0.01766 → 0.01809). Positive
+# per-duel margins with a falling absolute level is the winner's-curse
+# ratchet leak: crowns selected at z≈2.1-2.7 near the noise floor are
+# mostly luck, and each reign change re-baselines the king slightly lower.
+# δ=0.002 (~1.5x the typical 2·SE bar at v4 scale) restores the buffer that
+# absorbed that bias. Real >δ improvements (e.g. vera6 +0.0035, z=4.5)
+# still crown. Forward-only: reigns crowned under wvk 8 stand; no
+# retroactive re-verdicts.
+min_margin = 0.002
+# Median stripped thought length, in characters (2026-08-13, wvk=5).
+# Invalid challenger cannot crown. 80 sits above live cue phrases
+# ("Next command:" = 13, "Next bash command:" = 18) and below guass (~290)
+# / teacher (~240). Use the median so one long dump cannot wash a silent
+# miner. Set 0 to disable (pre-fork replay).
+min_thought_chars = 80
+# k teacher reference rollouts per turn (v4, 2026-08-17). Each ref is
+# baselined (lpC(y_i|∅)) and the miner's single thought is echo-scored
+# against every ref; turn_reason() takes the tempered log-mean-exp.
+n_teacher_samples = 3
+n_miner_samples = 1
+# Tempering temperature tau for the per-turn log-mean-exp (v4, 2026-08-17).
+# tau→∞ is the broken hedging mean; tau=1/L (~0.002) is the hard max.
+# 0.03 calibrated externally (AIIan, n=100 turns): commit beats hedge from
+# tau≈0.1 down, decisively at 0.03, while staying warm enough that one
+# lucky ref hit does not dominate (mode-guessing / leakage amplification
+# are the cold-tau failure modes — watched via telemetry, REDTEAM.md).
+tau = 0.03
+# Turn-score rule (v5, 2026-08-27, weight_version_key=10). "min_rg" scores
+# each turn min(centered R, banded G); "reason" is the wvk<=9 tempered
+# Reason, kept as the replay path for pre-fork verdicts.
+score_mode = "min_rg"
+# Grounding band half-width: w = max(band_c·stdev(t_i), band_floor) around
+# mu = mean(t_i), t_i = lpC(z_C^i|x) per byte. band_c=2.0 validated across
+# a 1x-4x sweep (honest beats the live filler suffix on 97-100% of turns at
+# every width; research/results/minrg_round2/band_sweep). band_floor keeps
+# the band open when the k=3 reference thoughts happen to agree tightly.
+band_c = 2.0
+band_floor = 0.002
+# 2026-09-05 (weight_version_key 11→12): forfeits are scored, not dropped.
+forfeit_turn_score = -0.1
+# ---- v6 (built 2026-09-04, operator directive; NOT live until the flip) ----
+# Two contract knobs, both implemented in score.py / evalsrv and both a
+# weight_version_key event when flipped (ops/v6/v6_toml_edits.py stages the
+# flip; it needs an explicit dated operator directive naming the key):
+#
+#   score_mode = "min_rga"     turn = min(R, G, A)
+#     A = tau·log((1/k)·Σ_i exp(b_i/tau)),  b_i = lpC(y_A|z_C^i) − lpC(y_A|∅)
+#     "Would the teacher, thinking its own thought i, take the miner's
+#     action?" — the dual of R, teacher-side only (no lpA surface), same
+#     tempered LME as R but NOT centered: centering rewards spread across
+#     refs, and an action every teacher thought licenses is the target; a
+#     generic action earns LESS lift than the right one, so the R-leg
+#     flat-lift attack has no analog here. Why: until v6 the miner's action
+#     was only licensed (B), never ranked. Bench transcripts of reigns 1–5
+#     (2026-09-04) show commands shrinking 426→150–250 chars while thoughts
+#     grow and steps multiply — the rule was indifferent. Cost: +k teacher
+#     echoes per turn per side (lpC_ya_zc; lpC_ya_e is the B baseline).
+#
+#   forfeit_turn_score = -0.1  per-turn score for a side with no parseable action
+#     Until v6 a forfeit was DROPPED from pairing (score.duel paired only
+#     turns valid on both sides): runaway thinking with no action cost
+#     nothing, and a miner could choose which turns entered its own mean.
+#     With the floor the turn stays paired — one-sided forfeit = loss by
+#     (floor − opponent's turn), two-sided = tie (diff 0, kept in n).
+#     Calibration (40 live min(R,G) duels, 100k valid turns): p1 of valid
+#     turn scores −0.087, p5 −0.041; live forfeit rates 1.7% median / 5.7%
+#     max per side. −0.1 sits under p1: forfeiting beats answering on <1%
+#     of turns (which a miner cannot predict), and a 2% forfeit rate costs
+#     exactly one δ (0.002) of margin. Absent = legacy drop (wvk ≤ 11 replay).
+# ---------------------------------------------------------------------------
+# ---- v7 (built 2026-09-07; LIVE 2026-09-09, weight_version_key 13) ---------
+#   require_think_close = true   a miner rollout that never emits </think>
+#     is a forfeit (scores forfeit_turn_score, same as no parseable action).
+#     Why: every OpenAI-compatible client that separates reasoning from the
+#     answer (vLLM reasoning parsers, Cursor, the chat pod) needs the
+#     closing tag; without it the whole reply is delivered as reasoning and
+#     the visible answer is empty. split_rollout treated the tag as
+#     optional, and we build the scored body with our own </think>, so the
+#     tag was dead weight to a miner: bench transcripts show genesis
+#     closing </think> on 95–98% of replies, the teacher on 99%, kings of
+#     reigns 1–5 on 0–4%, and the reign-8 king on 98% of SWE-scaffold
+#     replies but 0% of Cursor-shaped ones. Flipping this changes which
+#     turns score: weight_version_key event, explicit dated operator
+#     directive required. Until then the per-side </think> rate is
+#     published on every verdict (king/challenger.think_close_rate).
+# 2026-09-09 (weight_version_key 12→13, explicit dated operator directive):
+# on. A reply that never closes </think> scores forfeit_turn_score.
+require_think_close = true
+# Ops: skip prior-bank and non-Reason forced-logprob echos (telemetry GPU).
+score_bank = false
+reason_only = true
+# Teacher-side causality gate B = lpC(y_A|z_A) − lpC(y_A|∅) (design B).
+# ON as of 2026-08-13, weight_version_key=6. τ/γ match retired v2 A9.
+# Evalsrv adds two teacher echoes per pair (lpC_ya_za, lpC_ya_e).
+# Fill-in (n=80): thermo cue pass 20% (reject); guass CoT pass 45% (license).
+causality_gate = true
+causality_tau = 0.02
+causality_gamma = 0.30
+temperature = 0.8
+max_thought_tokens = 1024
+max_action_tokens = 768
+# Client-side turn pipelines in flight per side (ops knob, no scoring
+# effect). 24 -> 36 on 2026-08-15 with the teacher swarm absorbing echo
+# load. 36 -> 64 on 2026-08-29: two 8x B200 teacher boxes (16 TP1
+# replicas) were sitting at ~2 in-flight each under 36; 64 is one
+# request per GPU plus headroom for prefix-sticky turns.
+# 64 -> 192 on 2026-09-07 after echo prefix caching went live: echoes fell
+# from ~10 s to ~2 s, so the 64-slot teacher semaphore became the wall —
+# ~100 slot-seconds/turn (3 ref samples x 20 s + 21 echoes x 2 s) / 64 =
+# 0.64 turns/s = the measured 35 min/duel, with 16 teacher replicas at <1
+# in flight and miner engines at 1.5-2. Miner KV holds 7.3M tokens/engine
+# (55x 128k), teacher 1.1M/replica, so 192 turns/side fits both.
+concurrency = 192
+# Whole-duel wall clock budget on the eval server before the validator
+# classifies the eval as a transient failure and requeues.
+timeout_s = 7200
+
+[seed_king]
+# Genesis checkpoint crowned when the validator boots with empty state.
+# min(R,G) era genesis (2026-08-27, wvk 10): untouched Qwen3.6-35B-A3B —
+# the best-benching untouched model on swe_rebench_lite (0.20-0.24) and the
+# exact base the min(R,G) validation campaign was run against. Unpaid
+# (hotkey="") by design; emissions burn until the first registered crown.
+# Previous era genesis: dendriteholdings/albedo-qwen3.6-35b-king-genesis
+# @ abe89194d6addf82e71f3f1ba9fef94b05404abf (archived, era-wvk9).
+repo = "Qwen/Qwen3.6-35B-A3B"
+revision = "995ad96eacd98c81ed38be0c5b274b04031597b0"
+
+[bench]
+# Advisory benchmarks run on a dedicated always-on bench machine (never the
+# duel pod). NEVER part of S* or duels. Default suite is a pinned 25-task
+# SWE-rebench lite panel (coding isomorphism axis). tau2_* suites remain
+# supported by the runner if re-added here.
+enabled = true
+# 2026-09-06: swe_rebench_lite_300 = the same 25 tasks at the official
+# SWE-rebench budget (300 agent steps, 128k context) instead of 50 steps /
+# 65k. Across reigns 0-8, 23% of RESOLVED runs finished in steps 40-50 and
+# 56% of the runs that hit the 50-step cap were still editing/testing in
+# their last 10 steps — the cap truncated the distribution. The 50-step
+# rows stay in bench_history under their own suite name; both columns are
+# published. Advisory only — never part of the score.
+suites = ["swe_rebench_lite_300"]
+num_trials = 1
+# Parallel mini-SWE-agent workers (and swebench eval workers, capped at 8).
+# Rollouts are docker/CPU-bound most of the time; the H200 pair serving the
+# miner sits idle at 2 workers (measured 0% GPU util), so run wide.
+max_concurrency = 12
+# Unused for swe_rebench_lite; kept for tau2_* suites if re-enabled.
+user_llm = "teacher"
+# Which submissions get benched: "accepted" (new kings only) or "all".
+# 2026-08-18 operator directive: kings only — challenger churn was growing
+# the queue faster than the bench pod drains it.
+policy = "accepted"
+
+[bench_serving]
+# GPU layout on the dedicated bench pod (AFFINE_ROLE=bench). One miner slot.
+port = 8002
+gpus = "0,1"
+tp = 2
+# Bench serves plain generation (no echo+logprobs teacher forcing), so the
+# small prefill chunks the duel pod needs do not apply — big chunks keep
+# long-context agent prompts fast.
+max_num_batched_tokens = 16384
+# Official SWE-rebench protocol: 128k context (2026-09-06). Genesis-family
+# checkpoints support >=128k; the 2x B200 bench pod holds a 35B-A3B at TP=2
+# with ~140 GB per GPU spare for KV. Ops knob, no scoring effect.
+max_model_len = 131072
+
+[protocol_probe]
+# Chat-protocol conformance probe (built 2026-09-07; STAGED, mode off).
+# Admission rule in the class of the architecture pin — no scoring change,
+# no weight_version_key bump. On the eval pod, once the challenger is
+# served and probe_injectable has passed, evalsrv.protocol_probe renders a
+# fixed public prompt set (IDE-agent system prompt + greeting / code
+# question / follow-up / tool-call requests; plain-assistant prompts; a
+# no-system greeting) through the challenger's OWN chat template with
+# thinking on and tool schemas where the prompt has tools — exactly what
+# Cursor or any OpenAI client sends — and checks every reply for (1) a
+# closed </think> and (2) a non-empty visible answer after it (text, or one
+# well-formed <tool_call> when the prompt asks for a tool). Why: the
+# reign-8 king renders as an EMPTY message in Cursor — with a system prompt
+# it never emits </think>, so a reasoning parser files the whole reply as
+# hidden reasoning. Nothing in the score asked for the tag; this does.
+#   mode = "off"      nothing runs (default)
+#   mode = "shadow"   runs; result published on the verdict
+#                     (verdict.protocol_probe); never rejects
+#   mode = "enforce"  runs; pass_rate < min_pass_rate rejects the challenger
+#                     with rejection_reason "protocol:<detail>", before the
+#                     1,300-turn scoring (minutes, not an hour of echoes)
+# Recommended path: shadow at the next eval-pod redeploy, read a few
+# verdicts (genesis-family models should sit near 1.0; the reign-8 king
+# near 0.0), then enforce by operator decision.
+# 2026-09-08: shadow (operator directive after the SWE-bench Pro / Claude
+# Code post-mortem: the king answers compaction and final-report prompts
+# with reasoning only and no visible text). Enforce follows a verdict read.
+# 2026-09-09: enforce, with the wvk 13 flip (operator directive "make all the
+# changes and flip the bit"). Shadow read on 18 verdicts (chal-00348..365):
+# pass_rate 0.00–1.00, median 0.6, 1/18 at ≥ 0.90; every failure was
+# no_think_close. Admission rule (no wvk); min_pass_rate is the dial.
+mode = "enforce"
+min_pass_rate = 0.9
+n_samples = 2          # completions per prompt (10 prompts -> 20 replies)
+temperature = 0.7
+max_tokens = 1024
+
+[eval_machine]
+# GPU pod hosting duel evalsrv. The provisioner keeps exactly one alive and
+# reprovisions automatically on sustained health failure.
+provider_order = ["lium", "targon"]
+# Preference order: B300 (fastest / most VRAM) → B200 → H200. First match
+# under the price cap wins.
+gpu_types = ["B300", "B200", "H200"]
+gpu_type = "B300"   # legacy single-type field; gpu_types takes precedence
+gpu_count = 8
+# Hard price cap for the whole pod ($/hr). B300 8× sits ~$56–64.
+max_price_per_hour = 70.0
+port = 9000
+health_interval_s = 60
+# Strikes (one per health_interval_s) before terminate + reprovision. Must
+# ride out a routine evalsrv bounce: teacher re-warm takes ~6-7 checks of
+# ok=false, and soft restarts fire every 3rd strike, so 12 gives one full
+# restart + re-warm cycle before the nuclear option (~12 min for a truly
+# dead pod vs 30-60 min to re-rent and re-download weights).
+unhealthy_threshold = 12
+provision_timeout_s = 3600
+# Lium: docker template id to boot (leave empty for provider default).
+lium_template_id = ""
+# Targon: inventory tier + image for the RENTAL workload fallback.
+targon_resource = "h200-xlarge"
+targon_image = "vllm/vllm-openai:latest"
+
+[bench_machine]
+# Always-on dedicated SWE bench pod (separate from the duel eval machine).
+# Sized for one miner TP=2 serve + docker agent/eval — not the 8× duel layout.
+# Prefer H200: currently ~$23/hr for 2× vs B300 8× at ~$64 for the duel pod.
+provider_order = ["lium", "targon"]
+# H100 last-resort: 2×80GB comfortably serves a ~35B king at TP=2, and Lium
+# regularly has 2× H100 when all Blackwell/H200 2× inventory is gone.
+gpu_types = ["H200", "B200", "B300", "H100"]
+gpu_type = "H200"
+gpu_count = 2
+max_price_per_hour = 30.0
+port = 9001
+health_interval_s = 60
+unhealthy_threshold = 5
+provision_timeout_s = 3600
+lium_template_id = ""
+targon_resource = "h200-large"
+targon_image = "vllm/vllm-openai:latest"
+
+[chat_machine]
+# Always-on public chat pod (AFFINE_ROLE=chat): serves the CURRENT KING via
+# vLLM behind the website's /api/v1/chat proxy. Ops-only — never part of
+# scoring. ONE big-VRAM GPU: a 141GB H200 fits the ≤90GB king at TP=1 with
+# KV headroom, costs ~$4/hr (vs ~$23 for the 2×H200 bench layout), and 1×
+# H200 inventory is routinely available when every 2× tier is sold out
+# (observed 2026-08-20). 80GB cards are excluded — no headroom at TP=1.
+provider_order = ["lium", "targon"]
+gpu_types = ["H200", "B300", "B200"]
+gpu_type = "H200"
+gpu_count = 1
+max_price_per_hour = 12.0
+port = 9002
+health_interval_s = 60
+unhealthy_threshold = 5
+provision_timeout_s = 3600
+lium_template_id = ""
+targon_resource = "h200-large"
+targon_image = "vllm/vllm-openai:latest"
+
+[chat]
+# Public chat serving + abuse limits (chat pod + dash proxy). Ops knobs only.
+# vLLM slot on the chat pod: single-GPU TP=1 serve, shorter context — chat
+# doesn't need 64k corpus prefixes and the smaller KV leaves swap headroom.
+port = 8002
+gpus = "0"
+tp = 1
+max_model_len = 16384
+gpu_memory_utilization = 0.90
+max_num_batched_tokens = 16384
+# Where the pod learns the current king (public dash snapshot; polled).
+snapshot_url = "https://affine.io/api/v1/snapshot"
+poll_interval_s = 60
+# Per-reply generation cap and per-request input cap (characters).
+max_output_tokens = 1024
+max_input_chars = 16000
+# Dash-side abuse limits: sliding per-IP messages/minute + global in-flight.
+# 30/min (was 10, 2026-08-20): agent clients (arbos tool loops) make several
+# wire calls per user turn; the concurrency cap below is the real GPU guard.
+rate_limit_per_min = 30
+max_concurrency = 4
+
+[hippius]
+# Website + dashboard state pushed here; miners read it.
+endpoint = "https://s3.hippius.com"
+bucket = "affine-sn120"
+
+[data_r2]
+# Trace-first corpus store (Cloudflare R2, public read via the custom domain;
+# provisioned by scripts/data_r2_setup.py). Layout:
+#   traces/chunks/*.jsonl.gz, traces/manifests/{sha}.json, traces/manifest.json
+#     — rollout envelopes, immutable, written by the datagen pod
+#   views/{view_spec}/chunks/*.jsonl.gz + views/{view_spec}/index/*.parquet
+#   corpus/manifests/{sha}.json, corpus/manifest.json
+#     — the derived D evalsrv follows (schema_version 3), written by
+#       ops/corpus_build.py on the validator box
+#   turns/** — byte-identical copy of the Hippius corpus for replay
+# Credentials: DATA_R2_ACCESS_KEY_ID / DATA_R2_SECRET_ACCESS_KEY (publisher,
+# validator box) and ROLLOUTS_R2_* (writer, pod); endpoint DATA_R2_ENDPOINT.
+bucket = "affine-data"
+public_base_url = "https://data.affine.io"
+
+[dashboard]
+# Hot-path read API (affine-dash) — separate from Hippius archive.
+api_host = "127.0.0.1"
+api_port = 8787
+# Public URL for llms.txt / absolute links. Official site: https://affine.io
+# (Cloudflare-proxied to this box; sn120.arbos.life stays up as a legacy alias
+# via the Cloudflare tunnel).
+public_host = "affine.io"
+public_base_url = "https://affine.io"
+
+[validator]
+poll_interval_s = 30
+weight_interval_s = 300
+state_dir = "state"
+tick_warn_after_s = 120
+tick_restart_after_s = 2700
+stream_idle_warn_s = 180
+stream_idle_timeout_s = 420
+max_transient_eval_retries = 3
+# A persistent infra fault (dead king, a repo too large for the pod's disk)
+# never burns the miner, but after this many front-requeues the entry is
+# rotated to the queue tail so other submissions still get evaluated instead
+# of the head wedging forever.
+max_infra_front_requeues = 5
+dashboard_flush_min_interval_s = 5.0
+# Refuse to set weights if the metagraph has not refreshed within this many
+# seconds (stale uid→hotkey map would pay the wrong neurons).
+metagraph_max_age_s = 1800
+# Cap on retained finished eval-server job records (bounds pod memory).
+jobs_retention = 200
