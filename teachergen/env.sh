@@ -22,6 +22,13 @@ export TORCHINDUCTOR_CACHE_DIR="$TG_ROOT/cache/inductor"
 # The host has no compiler; Triton reads CC, Inductor reads CXX.
 export CC="$TG_ROOT/toolchain/bin/gcc"
 export CXX="$TG_ROOT/toolchain/bin/g++"
+# vLLM 0.28.0 ships torch cu130; an R570 driver (CUDA 12.8) refuses it.
+# Datacenter GPUs run it through the CUDA 13 forward-compat libcuda.
+CUDA_COMPAT=/usr/local/cuda-13.0/compat
+if [ -d "$CUDA_COMPAT" ] && [ "$(nvidia-smi --query-gpu=driver_version \
+    --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)" -lt 580 ] 2>/dev/null; then
+  export LD_LIBRARY_PATH="$CUDA_COMPAT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 # HF_TOKEN
 set -a
